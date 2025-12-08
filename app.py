@@ -9,11 +9,11 @@ st.set_page_config(page_title="CSV Data QA Tool", layout="wide")
 
 st.title("📊 Bfax Data QA Tool")
 st.markdown("""
-**capabilities:**
-1. **Source Flexibility:** Upload files directly or provide a direct download link (CSV or ZIP).
-2. **Auto-Decompression:** Automatically extracts and reads all CSVs inside ZIP files.
+**Capabilities:**
+1. **Source Flexibility:** Upload files or provide a direct download link.
+2. **Auto-Detection:** Automatically detects if a file is a ZIP (even if the URL doesn't say .zip).
 3. **Smart Column Detection:** Checks for **'Permit Number'** or **'Record Number'** interchangeably.
-4. **Global Consistency:** Ensures every ID appears in **all** files (sets must be identical).
+4. **Global Consistency:** Ensures every ID appears in **all** files.
 """)
 
 # --- Helper Functions ---
@@ -23,6 +23,8 @@ def normalize_id_column(df):
     Checks for 'Permit Number' or 'Record Number'.
     Returns the column name found, or None if neither exists.
     """
+    # normalize columns to lower case for loose matching if needed, 
+    # but for now we stick to exact case provided in prompt requirements
     if 'Permit Number' in df.columns:
         return 'Permit Number'
     elif 'Record Number' in df.columns:
@@ -38,34 +40,40 @@ def read_csv_content(file_buffer):
     except UnicodeDecodeError:
         file_buffer.seek(0)
         return pd.read_csv(file_buffer, encoding='latin-1')
+    except pd.errors.ParserError:
+        # If the file is not a valid CSV
+        return None
     except Exception:
         return None
 
 def process_file_data(file_name, file_content_bytes):
     """
-    Takes a filename and bytes. 
-    If ZIP: extracts all CSVs.
-    If CSV: reads directly.
+    Determines if content is a ZIP or CSV based on content (magic numbers),
+    not just the filename.
     Returns a dictionary: {filename: dataframe}
     """
     processed_dfs = {}
-    
-    # Check if it looks like a zip based on extension or header
-    # Simple extension check usually suffices for this context
-    if file_name.lower().endswith('.zip'):
+    file_buffer = io.BytesIO(file_content_bytes)
+
+    # 1. Try to open as ZIP first (Content-based detection)
+    if zipfile.is_zipfile(file_buffer):
         try:
-            with zipfile.ZipFile(io.BytesIO(file_content_bytes)) as z:
+            with zipfile.ZipFile(file_buffer) as z:
                 for sub_file in z.namelist():
-                    if sub_file.lower().endswith('.csv') and not sub_file.startswith('__MACOSX'):
+                    # Ignore MacOS metadata and non-csv files
+                    if sub_file.lower().endswith('.csv') and not sub_file.startswith('__MACOSX') and not sub_file.startswith('.'):
                         with z.open(sub_file) as f:
                             df = read_csv_content(f)
                             if df is not None:
                                 processed_dfs[sub_file] = df
         except zipfile.BadZipFile:
-            st.error(f"Failed to unzip {file_name}")
+            st.error(f"Error: The file '{file_name}' appears to be a corrupted zip.")
+    
+    # 2. If not a ZIP, try to read as a single CSV
     else:
-        # Assume CSV
-        df = read_csv_content(io.BytesIO(file_content_bytes))
+        # Reset buffer position just in case
+        file_buffer.seek(0)
+        df = read_csv_content(file_buffer)
         if df is not None:
             processed_dfs[file_name] = df
             
@@ -81,11 +89,12 @@ if input_method == "File Upload":
     uploaded_files = st.file_uploader("Upload CSV or ZIP files", type=["csv", "zip"], accept_multiple_files=True)
     if uploaded_files:
         for file in uploaded_files:
+            # Check file type using the buffer content
             new_dfs = process_file_data(file.name, file.read())
             loaded_dfs.update(new_dfs)
 
 elif input_method == "File URL":
-    url = st.text_input("Enter direct file URL (CSV or ZIP):", placeholder="https://dl.objcdn.com/...")
+    url = st.text_input("Enter direct file URL:", placeholder="https://dl.objcdn.com/...")
     if url:
         if st.button("Load from URL"):
             with st.spinner("Downloading and processing..."):
@@ -93,16 +102,17 @@ elif input_method == "File URL":
                     response = requests.get(url)
                     response.raise_for_status()
                     
-                    # Determine filename from URL or headers
+                    # Use URL as temporary filename
                     filename = url.split("/")[-1]
                     if not filename:
-                        filename = "downloaded_data.csv"
-                        
+                        filename = "downloaded_data"
+
+                    # Process content (auto-detects ZIP vs CSV)
                     new_dfs = process_file_data(filename, response.content)
                     loaded_dfs.update(new_dfs)
                     
                     if not new_dfs:
-                        st.error("No valid CSV data found at this URL.")
+                        st.error("Could not extract any valid CSV data. Please check if the link points to a CSV or a ZIP containing CSVs.")
                     else:
                         st.success(f"Successfully loaded {len(new_dfs)} file(s) from URL.")
                         
@@ -146,7 +156,6 @@ if loaded_dfs:
                     st.dataframe(df[df[id_col].isnull()])
                 
                 # Store IDs for cross-check (convert to string to ensure consistency)
-                # Drop NA values before creating set
                 current_ids = set(df[id_col].dropna().astype(str))
                 file_id_sets[file_name] = current_ids
 
@@ -154,7 +163,6 @@ if loaded_dfs:
 
             # B. Duplicates
             st.markdown("**Duplicate Analysis**")
-            # Default to checking ID col if exists
             default_cols = [id_col] if id_col else []
             
             cols_to_check = st.multiselect(
@@ -185,17 +193,10 @@ if loaded_dfs:
         
         # 2. Check each file against the Master Union
         inconsistency_found = False
-        
-        # Create a summary table
         summary_data = []
 
         for fname, f_ids in file_id_sets.items():
             missing_ids = all_ids_union - f_ids
-            # We also check extra IDs (though logically if we compare against Union, 
-            # 'extra' is impossible relative to the union, but we define 'extra' 
-            # as IDs present in this file but missing in OTHERS. 
-            # Actually, simply checking Missing from Union covers the requirement 
-            # "If it appears in one, it should appear in all".)
             
             if missing_ids:
                 inconsistency_found = True
@@ -219,7 +220,7 @@ if loaded_dfs:
         else:
             st.error("⚠️ Inconsistencies detected. Some files are missing IDs that exist in other files.")
             
-            # Detailed Breakdown of missing IDs
+            # Detailed Breakdown
             with st.expander("View Detailed Mismatches"):
                 for fname, f_ids in file_id_sets.items():
                     missing = all_ids_union - f_ids
