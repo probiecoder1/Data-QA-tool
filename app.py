@@ -3,278 +3,167 @@ import pandas as pd
 import io
 import requests
 import zipfile
+from typing import Dict, Optional, Set
 
-st.set_page_config(page_title="CSV Data QA Tool", layout="wide")
-
-st.title("📊 Universal Data QA Tool")
+st.set_page_config(
+    page_title="Data QA Engine",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 st.markdown("""
-**Capabilities**
-- Supports **Bfax** and **non-Bfax** projects
-- Upload files or load via **direct URL**
-- CSV or ZIP auto-detection
-- Global ID consistency checks
-- Duplicate detection
-- Schema comparison vs previous dataset
-- Column-level fill-rate analysis
-""")
+    <style>
+    .main { background-color: #f8f9fa; }
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .qa-card { padding: 20px; border: 1px solid #e6e9ef; border-radius: 10px; background: white; margin-bottom: 20px; }
+    div[data-testid="stExpander"] { border: none !important; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    </style>
+""", unsafe_allow_html=True)
 
-st.sidebar.header("Project Configuration")
+class DataProcessor:
+    @staticmethod
+    @st.cache_data(show_spinner=False)
+    def load_csv(buffer: io.BytesIO) -> Optional[pd.DataFrame]:
+        try:
+            buffer.seek(0)
+            return pd.read_csv(buffer)
+        except UnicodeDecodeError:
+            buffer.seek(0)
+            return pd.read_csv(buffer, encoding="latin-1")
+        except Exception as e:
+            st.error(f"Processing Error: {str(e)}")
+            return None
 
-project_type = st.sidebar.radio(
-    "Select Project Type",
-    ["Bfax", "Other"]
-)
+    @classmethod
+    def process_input(cls, name: str, content: bytes) -> Dict[str, pd.DataFrame]:
+        results = {}
+        buffer = io.BytesIO(content)
+        if zipfile.is_zipfile(buffer):
+            with zipfile.ZipFile(buffer) as z:
+                for f in z.namelist():
+                    if f.lower().endswith(".csv") and not f.startswith((".", "__MACOSX")):
+                        with z.open(f) as sub:
+                            df = cls.load_csv(io.BytesIO(sub.read()))
+                            if df is not None: results[f] = df
+        else:
+            df = cls.load_csv(buffer)
+            if df is not None: results[name] = df
+        return results
 
-if project_type == "Bfax":
-    USER_PRIMARY_ID = None
-else:
-    USER_PRIMARY_ID = st.sidebar.text_input(
-        "Enter Primary ID Column Name",
-        placeholder="e.g. Application ID"
-    ).strip() or None
+class QAEngine:
+    def __init__(self, project_type: str, user_id: Optional[str]):
+        self.project_type = project_type
+        self.user_id = user_id
 
-def normalize_id_column(df, project_type, user_primary_id=None):
-    if project_type == "Bfax":
-        for col in ["Permit Number", "Record Number"]:
-            if col in df.columns:
-                return col
+    def get_id_col(self, df: pd.DataFrame) -> Optional[str]:
+        if self.project_type == "Bfax":
+            for col in ["Permit Number", "Record Number"]:
+                if col in df.columns: return col
+        elif self.user_id in df.columns:
+            return self.user_id
         return None
-    else:
-        if user_primary_id and user_primary_id in df.columns:
-            return user_primary_id
-        return None
 
+    def get_fill_rate(self, df: pd.DataFrame) -> Dict[str, float]:
+        if len(df) == 0: return {c: 0.0 for c in df.columns}
+        return {c: round((df[c].notna().sum() / len(df)) * 100, 2) for c in df.columns}
 
-def read_csv_content(file_buffer):
-    try:
-        return pd.read_csv(file_buffer)
-    except UnicodeDecodeError:
-        file_buffer.seek(0)
-        return pd.read_csv(file_buffer, encoding="latin-1")
-    except Exception:
-        return None
-
-
-def process_file_data(file_name, file_content_bytes):
-    processed = {}
-    buffer = io.BytesIO(file_content_bytes)
-
-    if zipfile.is_zipfile(buffer):
-        with zipfile.ZipFile(buffer) as z:
-            for f in z.namelist():
-                if f.lower().endswith(".csv") and not f.startswith((".", "__MACOSX")):
-                    with z.open(f) as sub:
-                        df = read_csv_content(sub)
-                        if df is not None:
-                            processed[f] = df
-    else:
-        buffer.seek(0)
-        df = read_csv_content(buffer)
-        if df is not None:
-            processed[file_name] = df
-
-    return processed
-
-
-def column_profile(df):
-    total = len(df)
-    return {
-        col: round((df[col].notna().sum() / total) * 100, 2) if total else 0
-        for col in df.columns
-    }
-
-# ----------------------------------------------------
-# Current Data Input
-# ----------------------------------------------------
-st.sidebar.header("Current Dataset")
-
-input_method = st.sidebar.radio(
-    "Load Current Data Via",
-    ["File Upload", "File URL"]
-)
-
-loaded_dfs = {}
-
-if input_method == "File Upload":
-    files = st.sidebar.file_uploader(
-        "Upload CSV or ZIP",
-        type=["csv", "zip"],
-        accept_multiple_files=True
-    )
-    if files:
-        for f in files:
-            loaded_dfs.update(process_file_data(f.name, f.read()))
-
-else:
-    url = st.sidebar.text_input("Enter Direct File URL")
-    if url and st.sidebar.button("Load Current Data"):
-        r = requests.get(url)
-        r.raise_for_status()
-        name = url.split("/")[-1] or "current_data"
-        loaded_dfs.update(process_file_data(name, r.content))
-
-# ----------------------------------------------------
-# Previous Data Input
-# ----------------------------------------------------
-st.sidebar.header("Previous Dataset (Optional)")
-
-prev_method = st.sidebar.radio(
-    "Load Previous Data Via",
-    ["None", "File Upload", "File URL"]
-)
-
-previous_dfs = {}
-
-if prev_method == "File Upload":
-    prev_files = st.sidebar.file_uploader(
-        "Upload Previous CSV or ZIP",
-        type=["csv", "zip"],
-        accept_multiple_files=True,
-        key="prev"
-    )
-    if prev_files:
-        for f in prev_files:
-            previous_dfs.update(process_file_data(f.name, f.read()))
-
-elif prev_method == "File URL":
-    prev_url = st.sidebar.text_input("Previous Dataset URL")
-    if prev_url and st.sidebar.button("Load Previous Data"):
-        r = requests.get(prev_url)
-        r.raise_for_status()
-        name = prev_url.split("/")[-1] or "previous_data"
-        previous_dfs.update(process_file_data(name, r.content))
-
-if loaded_dfs:
-    st.divider()
-    st.header("1️⃣ Individual File QA")
-
-    file_id_sets = {}
-    tabs = st.tabs(list(loaded_dfs.keys()))
-
-    for i, fname in enumerate(loaded_dfs):
-        df = loaded_dfs[fname]
-
-        with tabs[i]:
-            st.subheader(fname)
-
-            id_col = normalize_id_column(df, project_type, USER_PRIMARY_ID)
-
-            if not id_col:
-                st.error("❌ Primary ID column not found")
-                file_id_sets[fname] = set()
-            else:
-                st.success(f"Primary ID: {id_col}")
-
-                nulls = df[id_col].isnull().sum()
-                if nulls:
-                    st.error(f"{nulls} missing ID values")
-                    st.dataframe(
-                        df[df[id_col].isnull()]
-                        .head(5)
-                        .rename_axis("Row")
-                        .reset_index()
-                    )
-                else:
-                    st.success("No missing IDs")
-
-                file_id_sets[fname] = set(df[id_col].dropna().astype(str))
-
-            st.markdown("**Duplicate Check**")
-            dup_cols = st.multiselect(
-                "Check duplicates on",
-                options=df.columns,
-                default=[id_col] if id_col else [],
-                key=f"dup_{i}"
-            )
-
-            if dup_cols:
-                dupes = df[df.duplicated(dup_cols, keep=False)]
-                if dupes.empty:
-                    st.success("No duplicates found")
-                else:
-                    st.warning(f"{len(dupes)} duplicate rows")
-                    st.dataframe(dupes.head(10))
-
-    # ------------------------------------------------
-    # Cross-File ID Consistency
-    # ------------------------------------------------
-    st.divider()
-    st.header("2️⃣ Cross-File ID Consistency")
-
-    if len(file_id_sets) > 1:
-        union_ids = set().union(*file_id_sets.values())
-
-        summary = []
-        inconsistent = False
-
-        for fname, ids in file_id_sets.items():
-            missing = union_ids - ids
-            if missing:
-                inconsistent = True
-                status = "❌ Inconsistent"
-            else:
-                status = "✅ Complete"
-
-            summary.append({
-                "File": fname,
-                "Status": status,
-                "Unique IDs": len(ids),
-                "Missing IDs": len(missing)
-            })
-
-        st.table(pd.DataFrame(summary))
-
-        if not inconsistent:
-            st.success("All files contain identical ID sets")
-
-    # ------------------------------------------------
-    # Previous Dataset Comparison
-    # ------------------------------------------------
-    if previous_dfs:
+def main():
+    with st.sidebar:
+        st.title("🛡️ QA Engine Config")
+        ptype = st.radio("Project Context", ["Bfax", "Standard"])
+        uid = st.text_input("Target ID Column", placeholder="e.g. GUID") if ptype == "Standard" else None
+        
         st.divider()
-        st.header("3️⃣ Previous Dataset Comparison")
+        
+        src_mode = st.radio("Source Mode", ["Upload", "Remote URL"])
+        curr_data = {}
+        if src_mode == "Upload":
+            files = st.file_uploader("Current Files", type=["csv", "zip"], accept_multiple_files=True)
+            if files:
+                for f in files: curr_data.update(DataProcessor.process_input(f.name, f.read()))
+        else:
+            url = st.text_input("Data URL")
+            if url and st.button("Fetch Data"):
+                r = requests.get(url)
+                curr_data.update(DataProcessor.process_input(url.split("/")[-1], r.content))
 
-        for fname, curr_df in loaded_dfs.items():
-            if fname not in previous_dfs:
-                st.warning(f"No previous file found for {fname}")
-                continue
+        prev_files = st.file_uploader("Previous Dataset (Comparison)", type=["csv", "zip"], accept_multiple_files=True)
+        prev_data = {}
+        if prev_files:
+            for f in prev_files: prev_data.update(DataProcessor.process_input(f.name, f.read()))
 
-            prev_df = previous_dfs[fname]
+    engine = QAEngine(ptype, uid)
 
-            curr_cols = set(curr_df.columns)
-            prev_cols = set(prev_df.columns)
+    if not curr_data:
+        st.info("👋 Welcome! Please load a dataset from the sidebar to begin auditing.")
+        return
 
-            missing_cols = prev_cols - curr_cols
-            new_cols = curr_cols - prev_cols
-            common_cols = curr_cols & prev_cols
-
-            st.subheader(fname)
-
-            if not missing_cols and not new_cols:
-                st.success("No schema changes")
+    st.header("📋 Audit Dashboard")
+    
+    file_ids: Dict[str, Set[str]] = {}
+    
+    tabs = st.tabs([f"📄 {name}" for name in curr_data.keys()])
+    for i, (name, df) in enumerate(curr_data.items()):
+        with tabs[i]:
+            id_col = engine.get_id_col(df)
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Rows", f"{len(df):,}")
+            m2.metric("Total Columns", len(df.columns))
+            
+            if id_col:
+                ids = set(df[id_col].dropna().astype(str))
+                file_ids[name] = ids
+                m3.metric("Unique IDs", f"{len(ids):,}")
+                
+                if df[id_col].isnull().any():
+                    st.warning(f"Found {df[id_col].isnull().sum()} null values in ID column.")
             else:
-                if missing_cols:
-                    st.error(f"Missing Columns: {', '.join(sorted(missing_cols))}")
-                if new_cols:
-                    st.warning(f"New Columns: {', '.join(sorted(new_cols))}")
+                m3.status("ID Missing", state="error")
 
-            curr_fill = column_profile(curr_df)
-            prev_fill = column_profile(prev_df)
+            col_left, col_right = st.columns([1, 1])
+            with col_left:
+                st.subheader("Data Preview")
+                st.dataframe(df.head(10), use_container_width=True)
+            
+            with col_right:
+                st.subheader("Uniqueness Audit")
+                checks = st.multiselect("Columns to verify", df.columns, default=[id_col] if id_col else [], key=f"check_{name}")
+                if checks:
+                    dupes = df[df.duplicated(checks, keep=False)]
+                    if not dupes.empty:
+                        st.error(f"Violation: {len(dupes)} non-unique rows detected.")
+                        st.dataframe(dupes.head(5))
+                    else:
+                        st.success("Uniqueness constraints validated.")
 
-            rows = []
-            for col in common_cols:
-                rows.append({
-                    "Column": col,
-                    "Previous Fill %": prev_fill[col],
-                    "Current Fill %": curr_fill[col],
-                    "Δ Change": round(curr_fill[col] - prev_fill[col], 2)
-                })
+    if len(file_ids) > 1:
+        st.divider()
+        st.header("🔗 Integrity Check (Cross-File)")
+        all_ids = set().union(*file_ids.values())
+        sync_report = []
+        for fname, ids in file_ids.items():
+            diff = all_ids - ids
+            sync_report.append({"Filename": fname, "Coverage": f"{(len(ids)/len(all_ids))*100:.1f}%", "Missing": len(diff)})
+        st.table(pd.DataFrame(sync_report))
 
-            if rows:
-                st.markdown("**Fill Rate Comparison (%)**")
-                st.dataframe(
-                    pd.DataFrame(rows)
-                    .sort_values("Δ Change")
-                    .reset_index(drop=True)
-                )
+    if prev_data:
+        st.divider()
+        st.header("📉 Regression Analysis")
+        for name, df in curr_data.items():
+            if name in prev_data:
+                with st.expander(f"Delta Analysis: {name}"):
+                    pdf = prev_data[name]
+                    curr_f, prev_f = engine.get_fill_rate(df), engine.get_fill_rate(pdf)
+                    
+                    diffs = []
+                    for c in set(df.columns) & set(pdf.columns):
+                        delta = curr_f[c] - prev_f[c]
+                        diffs.append({"Column": c, "Current %": curr_f[c], "Prev %": prev_f[c], "Change": delta})
+                    
+                    res_df = pd.DataFrame(diffs).sort_values("Change")
+                    st.dataframe(res_df.style.background_gradient(subset=['Change'], cmap='RdYlGn'), use_container_width=True)
+
+if __name__ == "__main__":
+    main()
