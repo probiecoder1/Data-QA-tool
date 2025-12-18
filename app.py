@@ -4,252 +4,277 @@ import io
 import requests
 import zipfile
 
-# --- Page Configuration ---
 st.set_page_config(page_title="CSV Data QA Tool", layout="wide")
 
-st.title("📊 Bfax Data QA Tool")
+st.title("📊 Universal Data QA Tool")
+
 st.markdown("""
-**Key Capabilities & Updates:**
-* **Source Flexibility:** Upload files or provide a direct download link (CSV or ZIP).
-* **Auto-Detection:** Automatically detects if a file is a ZIP by content.
-* **Flexible ID:** Checks for **'Permit Number'** or **'Record Number'** interchangeably.
-* **Global Consistency:** Ensures every Permit Number appears in **all** files.
-* **✨ Enhanced Debugging:** Displays examples and row numbers for all inconsistencies.
+**Capabilities**
+- Supports **Bfax** and **non-Bfax** projects
+- Upload files or load via **direct URL**
+- CSV or ZIP auto-detection
+- Global ID consistency checks
+- Duplicate detection
+- Schema comparison vs previous dataset
+- Column-level fill-rate analysis
 """)
 
-# --- Helper Functions ---
+st.sidebar.header("Project Configuration")
 
-def normalize_id_column(df):
-    """
-    Checks for 'Permit Number' or 'Record Number'.
-    Returns the column name found, or None if neither exists.
-    """
-    if 'Permit Number' in df.columns:
-        return 'Permit Number'
-    elif 'Record Number' in df.columns:
-        return 'Record Number'
-    return None
+project_type = st.sidebar.radio(
+    "Select Project Type",
+    ["Bfax", "Other"]
+)
+
+if project_type == "Bfax":
+    USER_PRIMARY_ID = None
+else:
+    USER_PRIMARY_ID = st.sidebar.text_input(
+        "Enter Primary ID Column Name",
+        placeholder="e.g. Application ID"
+    ).strip() or None
+
+def normalize_id_column(df, project_type, user_primary_id=None):
+    if project_type == "Bfax":
+        for col in ["Permit Number", "Record Number"]:
+            if col in df.columns:
+                return col
+        return None
+    else:
+        if user_primary_id and user_primary_id in df.columns:
+            return user_primary_id
+        return None
+
 
 def read_csv_content(file_buffer):
-    """
-    Attempts to read CSV from bytes buffer with UTF-8, falling back to Latin-1.
-    """
     try:
-        # Note: We use the default comma separator here.
         return pd.read_csv(file_buffer)
     except UnicodeDecodeError:
         file_buffer.seek(0)
-        return pd.read_csv(file_buffer, encoding='latin-1')
-    except pd.errors.ParserError:
-        return None
+        return pd.read_csv(file_buffer, encoding="latin-1")
     except Exception:
         return None
 
+
 def process_file_data(file_name, file_content_bytes):
-    """
-    Determines if content is a ZIP or CSV based on content (magic numbers).
-    Returns a dictionary: {filename: dataframe}
-    """
-    processed_dfs = {}
-    file_buffer = io.BytesIO(file_content_bytes)
+    processed = {}
+    buffer = io.BytesIO(file_content_bytes)
 
-    # 1. Try to open as ZIP first (Content-based detection)
-    if zipfile.is_zipfile(file_buffer):
-        try:
-            with zipfile.ZipFile(file_buffer) as z:
-                for sub_file in z.namelist():
-                    if sub_file.lower().endswith('.csv') and not sub_file.startswith('__MACOSX') and not sub_file.startswith('.'):
-                        with z.open(sub_file) as f:
-                            df = read_csv_content(f)
-                            if df is not None:
-                                processed_dfs[sub_file] = df
-        except zipfile.BadZipFile:
-            st.error(f"Error: The file '{file_name}' appears to be a corrupted zip.")
-    
-    # 2. If not a ZIP, try to read as a single CSV
+    if zipfile.is_zipfile(buffer):
+        with zipfile.ZipFile(buffer) as z:
+            for f in z.namelist():
+                if f.lower().endswith(".csv") and not f.startswith((".", "__MACOSX")):
+                    with z.open(f) as sub:
+                        df = read_csv_content(sub)
+                        if df is not None:
+                            processed[f] = df
     else:
-        file_buffer.seek(0)
-        df = read_csv_content(file_buffer)
+        buffer.seek(0)
+        df = read_csv_content(buffer)
         if df is not None:
-            processed_dfs[file_name] = df
-            
-    return processed_dfs
+            processed[file_name] = df
 
-# --- Input Section ---
-st.sidebar.header("Data Input")
-input_method = st.sidebar.radio("Choose Input Method:", ["File Upload", "File URL"])
+    return processed
 
-loaded_dfs = {} 
+
+def column_profile(df):
+    total = len(df)
+    return {
+        col: round((df[col].notna().sum() / total) * 100, 2) if total else 0
+        for col in df.columns
+    }
+
+# ----------------------------------------------------
+# Current Data Input
+# ----------------------------------------------------
+st.sidebar.header("Current Dataset")
+
+input_method = st.sidebar.radio(
+    "Load Current Data Via",
+    ["File Upload", "File URL"]
+)
+
+loaded_dfs = {}
 
 if input_method == "File Upload":
-    uploaded_files = st.file_uploader("Upload CSV or ZIP files", type=["csv", "zip"], accept_multiple_files=True)
-    if uploaded_files:
-        for file in uploaded_files:
-            new_dfs = process_file_data(file.name, file.read())
-            loaded_dfs.update(new_dfs)
+    files = st.sidebar.file_uploader(
+        "Upload CSV or ZIP",
+        type=["csv", "zip"],
+        accept_multiple_files=True
+    )
+    if files:
+        for f in files:
+            loaded_dfs.update(process_file_data(f.name, f.read()))
 
-elif input_method == "File URL":
-    url = st.text_input("Enter direct file URL:", placeholder="https://dl.objcdn.com/...")
-    if url:
-        if st.button("Load from URL"):
-            with st.spinner("Downloading and processing..."):
-                try:
-                    response = requests.get(url)
-                    response.raise_for_status()
-                    
-                    filename = url.split("/")[-1]
-                    if not filename:
-                        filename = "downloaded_data"
+else:
+    url = st.sidebar.text_input("Enter Direct File URL")
+    if url and st.sidebar.button("Load Current Data"):
+        r = requests.get(url)
+        r.raise_for_status()
+        name = url.split("/")[-1] or "current_data"
+        loaded_dfs.update(process_file_data(name, r.content))
 
-                    new_dfs = process_file_data(filename, response.content)
-                    loaded_dfs.update(new_dfs)
-                    
-                    if not new_dfs:
-                        st.error("Could not extract any valid CSV data.")
-                    else:
-                        st.success(f"Successfully loaded {len(new_dfs)} file(s) from URL.")
-                        
-                except Exception as e:
-                    st.error(f"Error downloading file: {e}")
+# ----------------------------------------------------
+# Previous Data Input
+# ----------------------------------------------------
+st.sidebar.header("Previous Dataset (Optional)")
 
-# --- Main Processing Logic ---
+prev_method = st.sidebar.radio(
+    "Load Previous Data Via",
+    ["None", "File Upload", "File URL"]
+)
+
+previous_dfs = {}
+
+if prev_method == "File Upload":
+    prev_files = st.sidebar.file_uploader(
+        "Upload Previous CSV or ZIP",
+        type=["csv", "zip"],
+        accept_multiple_files=True,
+        key="prev"
+    )
+    if prev_files:
+        for f in prev_files:
+            previous_dfs.update(process_file_data(f.name, f.read()))
+
+elif prev_method == "File URL":
+    prev_url = st.sidebar.text_input("Previous Dataset URL")
+    if prev_url and st.sidebar.button("Load Previous Data"):
+        r = requests.get(prev_url)
+        r.raise_for_status()
+        name = prev_url.split("/")[-1] or "previous_data"
+        previous_dfs.update(process_file_data(name, r.content))
 
 if loaded_dfs:
-    # --- Part 1: Individual File Analysis ---
     st.divider()
-    st.header(f"1. Individual File Analysis ({len(loaded_dfs)} files loaded)")
-    
-    file_names = list(loaded_dfs.keys())
-    tabs = st.tabs(file_names)
+    st.header("1️⃣ Individual File QA")
 
     file_id_sets = {}
+    tabs = st.tabs(list(loaded_dfs.keys()))
 
-    for i, file_name in enumerate(file_names):
-        df = loaded_dfs[file_name]
+    for i, fname in enumerate(loaded_dfs):
+        df = loaded_dfs[fname]
+
         with tabs[i]:
-            st.subheader(f"📄 {file_name}")
-            
-            # A. ID Column Check
-            id_col = normalize_id_column(df)
-            
-            if id_col is None:
-                st.error("❌ CRITICAL: Neither 'Permit Number' nor 'Record Number' columns were found.")
-                file_id_sets[file_name] = set() 
+            st.subheader(fname)
+
+            id_col = normalize_id_column(df, project_type, USER_PRIMARY_ID)
+
+            if not id_col:
+                st.error("❌ Primary ID column not found")
+                file_id_sets[fname] = set()
             else:
-                st.info(f"ℹ️ Identified ID Column: **{id_col}**")
-                
-                # Check for nulls in ID
-                id_nulls = df[id_col].isnull().sum()
-                if id_nulls == 0:
-                    st.success(f"✅ '{id_col}' has no missing values.")
+                st.success(f"Primary ID: {id_col}")
+
+                nulls = df[id_col].isnull().sum()
+                if nulls:
+                    st.error(f"{nulls} missing ID values")
+                    st.dataframe(
+                        df[df[id_col].isnull()]
+                        .head(5)
+                        .rename_axis("Row")
+                        .reset_index()
+                    )
                 else:
-                    st.error(f"❌ '{id_col}' has **{id_nulls}** missing values.")
-                    # Display examples of rows missing the ID
-                    bad_rows = df[df[id_col].isnull()].head(5).rename_axis('Row Index').reset_index()
-                    st.dataframe(bad_rows)
-                
-                # Store IDs for cross-check
-                current_ids = set(df[id_col].dropna().astype(str))
-                file_id_sets[file_name] = current_ids
+                    st.success("No missing IDs")
 
-            st.divider()
+                file_id_sets[fname] = set(df[id_col].dropna().astype(str))
 
-            # B. Duplicates
-            st.markdown("**Duplicate Analysis**")
-            default_cols = [id_col] if id_col else []
-            
-            cols_to_check = st.multiselect(
-                f"Check duplicates based on:",
+            st.markdown("**Duplicate Check**")
+            dup_cols = st.multiselect(
+                "Check duplicates on",
                 options=df.columns,
-                default=default_cols,
-                key=f"dupe_{i}"
+                default=[id_col] if id_col else [],
+                key=f"dup_{i}"
             )
-            
-            if cols_to_check:
-                dup_mask = df.duplicated(subset=cols_to_check, keep=False)
-                dup_count = dup_mask.sum()
-                
-                if dup_count == 0:
-                    st.success("✅ No duplicates found.")
+
+            if dup_cols:
+                dupes = df[df.duplicated(dup_cols, keep=False)]
+                if dupes.empty:
+                    st.success("No duplicates found")
                 else:
-                    st.warning(f"⚠️ Found **{dup_count}** duplicate rows.")
-                    # Display examples of duplicates
-                    dupe_rows = df[dup_mask].sort_values(by=cols_to_check).head(10).rename_axis('Row Index').reset_index()
-                    st.dataframe(dupe_rows)
+                    st.warning(f"{len(dupes)} duplicate rows")
+                    st.dataframe(dupes.head(10))
 
-    # --- Part 2: Global Cross-File Consistency ---
+    # ------------------------------------------------
+    # Cross-File ID Consistency
+    # ------------------------------------------------
     st.divider()
-    st.header("2. Global Cross-File Consistency")
-    st.markdown("Checking that **every** ID appears in **every** file.")
+    st.header("2️⃣ Cross-File ID Consistency")
 
-    if len(loaded_dfs) < 2:
-        st.warning("⚠️ Need at least 2 files to perform consistency checks.")
-    else:
-        # 1. Calculate the 'Master Union' (All unique IDs found in ANY file)
-        all_ids_union = set().union(*file_id_sets.values())
-        
-        inconsistency_found = False
-        summary_data = []
+    if len(file_id_sets) > 1:
+        union_ids = set().union(*file_id_sets.values())
 
-        for fname, f_ids in file_id_sets.items():
-            df = loaded_dfs[fname]
-            id_col = normalize_id_column(df) # Get the specific ID column name for this file
-            
-            missing_ids = all_ids_union - f_ids
-            
-            if missing_ids:
-                inconsistency_found = True
+        summary = []
+        inconsistent = False
+
+        for fname, ids in file_id_sets.items():
+            missing = union_ids - ids
+            if missing:
+                inconsistent = True
                 status = "❌ Inconsistent"
-                count_missing = len(missing_ids)
             else:
                 status = "✅ Complete"
-                count_missing = 0
-            
-            summary_data.append({
-                "File Name": fname,
+
+            summary.append({
+                "File": fname,
                 "Status": status,
-                "Total Unique IDs": len(f_ids),
-                "Missing IDs (relative to all files)": count_missing
+                "Unique IDs": len(ids),
+                "Missing IDs": len(missing)
             })
 
-        st.table(pd.DataFrame(summary_data))
+        st.table(pd.DataFrame(summary))
 
-        if not inconsistency_found:
-            st.success("🎉 PERFECT MATCH: All files contain exactly the same set of IDs.")
-        else:
-            st.error("⚠️ Inconsistencies detected. Some files are missing IDs that exist in other files.")
-            
-            # Detailed Breakdown: Show the full rows corresponding to the missing IDs
-            with st.expander("View Detailed Mismatches (Full Rows from source files)"):
-                
-                # 1. Find the master set of rows that cause the issue
-                missing_in_files = {} # Stores {filename: list_of_IDs_to_display}
+        if not inconsistent:
+            st.success("All files contain identical ID sets")
 
-                for fname, f_ids in file_id_sets.items():
-                    # IDs that exist in this file, but are missing from others 
-                    # (i.e., this file has IDs that are NOT in the intersection of all files)
-                    
-                    # Instead, we focus on: IDs that are in the UNION, but NOT in this specific file.
-                    
-                    missing_from_this_file = all_ids_union - f_ids
-                    
-                    if missing_from_this_file:
-                        # Find which files DO contain these missing IDs
-                        source_files = []
-                        for other_fname, other_f_ids in file_id_sets.items():
-                            if other_fname != fname:
-                                common_missing = missing_from_this_file.intersection(other_f_ids)
-                                if common_missing:
-                                    source_files.append(other_fname)
-                        
-                        st.subheader(f"IDs Missing In: **{fname}**")
-                        st.write(f"This file is missing **{len(missing_from_this_file)}** IDs. Examples are found in: **{', '.join(source_files[:3])}...**")
-                        
-                        # Find the actual rows in the *source* files that contain the missing IDs
-                        
-                        # We can only display the list of IDs here for conciseness
-                        st.text_area(f"IDs missing from {fname}:", 
-                                     value='\n'.join(list(missing_from_this_file)[:10]) + (f'\n...and {len(missing_from_this_file) - 10} more' if len(missing_from_this_file) > 10 else ''), 
-                                     height=150)
-                        
-                        st.markdown("---")
+    # ------------------------------------------------
+    # Previous Dataset Comparison
+    # ------------------------------------------------
+    if previous_dfs:
+        st.divider()
+        st.header("3️⃣ Previous Dataset Comparison")
+
+        for fname, curr_df in loaded_dfs.items():
+            if fname not in previous_dfs:
+                st.warning(f"No previous file found for {fname}")
+                continue
+
+            prev_df = previous_dfs[fname]
+
+            curr_cols = set(curr_df.columns)
+            prev_cols = set(prev_df.columns)
+
+            missing_cols = prev_cols - curr_cols
+            new_cols = curr_cols - prev_cols
+            common_cols = curr_cols & prev_cols
+
+            st.subheader(fname)
+
+            if not missing_cols and not new_cols:
+                st.success("No schema changes")
+            else:
+                if missing_cols:
+                    st.error(f"Missing Columns: {', '.join(sorted(missing_cols))}")
+                if new_cols:
+                    st.warning(f"New Columns: {', '.join(sorted(new_cols))}")
+
+            curr_fill = column_profile(curr_df)
+            prev_fill = column_profile(prev_df)
+
+            rows = []
+            for col in common_cols:
+                rows.append({
+                    "Column": col,
+                    "Previous Fill %": prev_fill[col],
+                    "Current Fill %": curr_fill[col],
+                    "Δ Change": round(curr_fill[col] - prev_fill[col], 2)
+                })
+
+            if rows:
+                st.markdown("**Fill Rate Comparison (%)**")
+                st.dataframe(
+                    pd.DataFrame(rows)
+                    .sort_values("Δ Change")
+                    .reset_index(drop=True)
+                )
